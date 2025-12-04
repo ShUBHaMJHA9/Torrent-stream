@@ -1,0 +1,286 @@
+import express from "express";
+import WebTorrent from "webtorrent";
+import cors from "cors";
+import ffmpeg from "fluent-ffmpeg";
+import fs from "fs";
+import path from "path";
+import { randomBytes } from "crypto";
+import { spawnSync } from "child_process";
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// WebTorrent client
+const client = new WebTorrent();
+const streams = {}; // { id: { folder, torrent, filePath, ready, createdAt, poll, cleanupTimer, error }}
+
+client.on('error', (err) => console.error('webtorrent client error', err));
+
+// Check ffmpeg availability
+let ffmpegAvailable = true;
+try {
+  const out = spawnSync('ffmpeg', ['-version']);
+  if (out.error || out.status !== 0) {
+    ffmpegAvailable = false;
+    console.warn('ffmpeg not found in PATH. HLS conversion disabled.');
+  }
+} catch (e) {
+  ffmpegAvailable = false;
+  console.warn('ffmpeg not found in PATH. HLS conversion disabled.');
+}
+
+function extractInfoHash(magnet) {
+  if (!magnet || typeof magnet !== 'string') return null;
+  const m = magnet.match(/xt=urn:btih:([a-fA-F0-9]{40}|[a-zA-Z0-9]{32})/);
+  return m ? m[1].toLowerCase() : null;
+}
+
+function safeRmDir(folder) {
+  try {
+    if (!folder || folder === '/' || !folder.startsWith('/tmp/')) return;
+    fs.rmSync(folder, { recursive: true, force: true });
+  } catch (e) {
+    console.warn('cleanup failed', e);
+  }
+}
+
+function scheduleCleanup(id, ms = 1000 * 60 * 30) { // 30 minutes
+  const entry = streams[id];
+  if (!entry) return;
+  if (entry.cleanupTimer) clearTimeout(entry.cleanupTimer);
+  entry.cleanupTimer = setTimeout(() => {
+    console.log('auto-cleanup stream', id);
+    stopStream(id);
+  }, ms);
+}
+
+function stopStream(id) {
+  const entry = streams[id];
+  if (!entry) return false;
+  try {
+    if (entry.poll) clearInterval(entry.poll);
+    if (entry.cleanupTimer) clearTimeout(entry.cleanupTimer);
+    if (entry.torrent) {
+      try { entry.torrent.destroy(); } catch (e) {}
+    }
+    safeRmDir(entry.folder);
+  } catch (e) {
+    console.warn('stopStream error', e);
+  }
+  delete streams[id];
+  return true;
+}
+
+// PROCESS TORRENT (shared)
+function processTorrent(torrent, id) {
+  const entry = streams[id];
+  if (!entry) return;
+  console.log(`processing torrent ${torrent.infoHash} for stream ${id}`);
+  entry.torrent = torrent;
+
+  torrent.on('wire', () => {
+    // reset cleanup timer on peer activity
+    scheduleCleanup(id);
+  });
+  torrent.on('error', (err) => {
+    console.error('torrent error', err);
+    if (streams[id]) streams[id].error = String(err.message || err);
+  });
+
+  // select first playable file
+  const file = torrent.files.find(f => /\.(mp4|mkv|webm|mov)$/i.test(f.name));
+  if (!file) {
+    entry.error = 'no_playable_file';
+    console.error('no playable file');
+    return;
+  }
+
+  // ensure folder exists
+  fs.mkdirSync(entry.folder, { recursive: true });
+  const dst = path.join(entry.folder, path.basename(file.name));
+  entry.filePath = dst;
+
+  // stream file to disk as it downloads
+  const ws = fs.createWriteStream(dst);
+  const rs = file.createReadStream({ start: 0 });
+  rs.pipe(ws);
+  rs.on('error', (e) => console.warn('file read stream error', e));
+  ws.on('error', (e) => console.warn('file write stream error', e));
+
+  if (!ffmpegAvailable) {
+    entry.error = 'ffmpeg_missing';
+    console.warn('ffmpeg not available; HLS will not be generated');
+    return;
+  }
+
+  // start ffmpeg reading from the torrent file stream (a fresh stream)
+  const ffIn = file.createReadStream();
+  const playlist = path.join(entry.folder, 'playlist.m3u8');
+  const segmentPattern = path.join(entry.folder, 'segment_%03d.ts');
+
+  ffmpeg(ffIn)
+    .output(playlist)
+    .addOptions([
+      '-profile:v baseline', '-level 3.0', '-start_number 0',
+      '-hls_time 4', '-hls_list_size 0',
+      '-hls_segment_filename', segmentPattern,
+      '-f hls'
+    ])
+    .on('start', (cmd) => console.log('ffmpeg start for', id, cmd))
+    .on('error', (err) => {
+      console.error('ffmpeg error', err);
+      if (streams[id]) streams[id].error = 'ffmpeg_error:' + (err.message || err);
+    })
+    .on('end', () => {
+      console.log('ffmpeg finished for', id);
+      if (streams[id]) streams[id].ready = true;
+    })
+    .run();
+
+  // poll for playlist + at least one segment
+  const poll = setInterval(() => {
+    try {
+      if (!fs.existsSync(playlist)) return;
+      const files = fs.readdirSync(entry.folder);
+      const segs = files.filter(n => /segment_\d+\.ts$/.test(n));
+      const st = fs.statSync(playlist);
+      if (st.size > 0 && segs.length > 0) {
+        entry.ready = true;
+        entry.playlist = playlist;
+        clearInterval(poll);
+        scheduleCleanup(id);
+        console.log('stream ready', id);
+      }
+    } catch (e) {}
+  }, 1000);
+  entry.poll = poll;
+}
+
+// ---------------------------
+// POST /stream
+// ---------------------------
+app.post('/stream', (req, res) => {
+  const magnet = req.body.magnet;
+  if (!magnet) return res.status(400).json({ error: 'magnet required' });
+  if (!ffmpegAvailable) console.warn('ffmpeg not available; /stream will still create session but HLS generation disabled');
+
+  const id = randomBytes(4).toString('hex');
+  const folder = path.join('/tmp', id);
+  streams[id] = { folder, ready: false, createdAt: Date.now() };
+
+  // see if torrent already added
+  const infoHash = extractInfoHash(magnet);
+  let existing = null;
+  try {
+    if (infoHash) existing = client.get(infoHash);
+    if (!existing) existing = client.get(magnet);
+  } catch (e) {
+    existing = null;
+  }
+
+  if (existing) {
+    processTorrent(existing, id);
+  } else {
+    client.add(magnet, (torrent) => processTorrent(torrent, id));
+  }
+
+  res.json({ stream_id: id, hls_url: `/hls/${id}/playlist.m3u8`, mp4_url: `/stream/${id}` });
+});
+
+// ---------------------------
+// HLS: playlist route (wait until ready) and static segments
+// ---------------------------
+app.get('/hls/:id/playlist.m3u8', (req, res) => {
+  const id = req.params.id;
+  const entry = streams[id];
+  if (!entry) return res.status(404).send('Invalid stream');
+  if (entry.error) return res.status(500).json({ error: entry.error });
+  if (!entry.ready) return res.status(202).json({ ready: false });
+  const p = entry.playlist;
+  if (!p || !fs.existsSync(p)) return res.status(404).send('Playlist not found yet');
+  res.sendFile(p);
+});
+
+// serve HLS segments and other files directly
+app.get('/hls/:id/:file', (req, res) => {
+  const id = req.params.id;
+  const entry = streams[id];
+  if (!entry) return res.status(404).send('Invalid stream');
+  const file = req.params.file;
+  const fp = path.join(entry.folder, file);
+  if (!fp.startsWith(entry.folder)) return res.status(400).send('Bad request');
+  if (!fs.existsSync(fp)) return res.status(404).send('Not found');
+  res.sendFile(fp);
+});
+
+// ---------------------------
+// Direct MP4 stream (Range support) - serve saved file
+// ---------------------------
+app.get('/stream/:id', (req, res) => {
+  const id = req.params.id;
+  const entry = streams[id];
+  if (!entry) return res.status(404).send('Invalid stream');
+  if (!entry.filePath) return res.status(404).send('File not ready');
+
+  const stat = fs.existsSync(entry.filePath) ? fs.statSync(entry.filePath) : null;
+  if (!stat) return res.status(404).send('File not available yet');
+
+  const total = stat.size;
+  const range = req.headers.range;
+  if (!range) {
+    res.writeHead(200, { 'Content-Length': total, 'Content-Type': 'video/mp4' });
+    fs.createReadStream(entry.filePath).pipe(res);
+    scheduleCleanup(id);
+    return;
+  }
+
+  const parts = range.replace(/bytes=/, '').split('-');
+  const start = parseInt(parts[0], 10);
+  const end = parts[1] ? parseInt(parts[1], 10) : total - 1;
+  if (start >= total || end >= total) return res.status(416).set('Content-Range', `bytes */${total}`).end();
+
+  res.writeHead(206, {
+    'Content-Range': `bytes ${start}-${end}/${total}`,
+    'Accept-Ranges': 'bytes',
+    'Content-Length': (end - start) + 1,
+    'Content-Type': 'video/mp4'
+  });
+  fs.createReadStream(entry.filePath, { start, end }).pipe(res);
+  scheduleCleanup(id);
+});
+
+// status endpoint
+app.get('/status/:id', (req, res) => {
+  const id = req.params.id;
+  const entry = streams[id];
+  if (!entry) return res.status(404).json({ error: 'Invalid stream' });
+  const t = entry.torrent;
+  const status = {
+    ready: !!entry.ready,
+    folder: entry.folder,
+    file: entry.filePath ? path.basename(entry.filePath) : null,
+    error: entry.error || null,
+    createdAt: entry.createdAt,
+  };
+  if (t) {
+    status.progress = Math.round((t.progress || 0) * 10000) / 100;
+    status.numPeers = t.numPeers || 0;
+    status.downloadSpeed = t.downloadSpeed || 0;
+  }
+  res.json(status);
+});
+
+// stop and cleanup a stream
+app.post('/stop/:id', (req, res) => {
+  const id = req.params.id;
+  if (!streams[id]) return res.status(404).json({ error: 'Invalid stream' });
+  stopStream(id);
+  res.json({ ok: true });
+});
+
+// health
+app.get('/health', (req, res) => res.json({ ok: true }));
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log('Server running on', port));
