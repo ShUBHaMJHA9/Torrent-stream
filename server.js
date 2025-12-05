@@ -7,6 +7,7 @@ import path from "path";
 import { randomBytes } from "crypto";
 import { spawn, spawnSync, exec } from "child_process";
 import { promisify } from "util";
+import os from 'os';
 
 const execAsync = promisify(exec);
 const app = express();
@@ -52,6 +53,98 @@ try {
 }
 
 // ====== Subtitle & Language Detection ======
+
+// -----------------
+// Container resource detection (cgroup-aware)
+// -----------------
+function safeReadFile(path) {
+    try {
+        return fs.readFileSync(path, 'utf8').trim();
+    } catch (e) {
+        return null;
+    }
+}
+
+function detectCgroupMemoryMB() {
+    // cgroup v2: memory.max, cgroup v1: memory.limit_in_bytes
+    const memMaxV2 = safeReadFile('/sys/fs/cgroup/memory.max') || safeReadFile('/sys/fs/cgroup/memory.max_us');
+    if (memMaxV2 && memMaxV2 !== 'max') {
+        const v = parseInt(memMaxV2, 10);
+        if (!isNaN(v) && v > 0) return Math.floor(v / 1024 / 1024);
+    }
+
+    const memLimitV1 = safeReadFile('/sys/fs/cgroup/memory/memory.limit_in_bytes');
+    if (memLimitV1 && memLimitV1 !== 'max') {
+        const v = parseInt(memLimitV1, 10);
+        if (!isNaN(v) && v > 0) return Math.floor(v / 1024 / 1024);
+    }
+
+    // fallback to os.totalmem
+    return Math.floor(os.totalmem() / 1024 / 1024);
+}
+
+function detectCgroupCpuCount() {
+    // cgroup v2: cpu.max (quota period) or cpu.cfs_quota_us and cpu.cfs_period_us in v1
+    const cpuMax = safeReadFile('/sys/fs/cgroup/cpu.max');
+    if (cpuMax) {
+        const parts = cpuMax.split(' ');
+        if (parts[0] !== 'max') {
+            const quota = parseInt(parts[0], 10);
+            const period = parseInt(parts[1] || '100000', 10);
+            if (!isNaN(quota) && quota > 0 && !isNaN(period) && period > 0) {
+                return Math.max(1, Math.floor(quota / period));
+            }
+        }
+    }
+
+    const quota = safeReadFile('/sys/fs/cgroup/cpu/cpu.cfs_quota_us');
+    const period = safeReadFile('/sys/fs/cgroup/cpu/cpu.cfs_period_us');
+    if (quota && period) {
+        const q = parseInt(quota, 10);
+        const p = parseInt(period, 10);
+        if (!isNaN(q) && q > 0 && !isNaN(p) && p > 0) {
+            return Math.max(1, Math.floor(q / p));
+        }
+    }
+
+    // fallback to os.cpus().length
+    return Math.max(1, os.cpus().length);
+}
+
+let detectedMemoryMB = detectCgroupMemoryMB();
+let detectedCpus = detectCgroupCpuCount();
+
+function recomputeDetectedResources() {
+    detectedMemoryMB = detectCgroupMemoryMB();
+    detectedCpus = detectCgroupCpuCount();
+}
+
+// Recompute periodically in case cgroup limits change
+setInterval(recomputeDetectedResources, 15000);
+
+// Expose helper to compute runtime defaults based on detected resources
+function computeRuntimeDefaults() {
+    const mem = detectedMemoryMB; // MB
+    const cpus = detectedCpus;
+
+    // Estimate safe ffmpeg memory per process (MB)
+    const perFfmpegMB = mem < 700 ? 256 : (mem < 1500 ? 512 : 800);
+
+    // Max concurrent ffmpeg limited by memory and CPUs
+    const byMem = Math.max(1, Math.floor(mem / (perFfmpegMB * 1.2)));
+    const byCpu = Math.max(1, Math.floor(cpus / 2));
+    const maxConcurrent = Math.max(1, Math.min(byMem, byCpu));
+
+    // Threads per ffmpeg: 1 on low memory, otherwise cpus/2
+    const threads = mem < 1024 ? 1 : Math.max(1, Math.floor(cpus / 2));
+
+    return { mem, cpus, perFfmpegMB, maxConcurrent, threads };
+}
+
+// Allow env overrides but default to computed ones
+const runtimeDefaults = computeRuntimeDefaults();
+const DEFAULT_MAX_CONCURRENT_FFMPEG = parseInt(process.env.MAX_CONCURRENT_FFMPEG || String(runtimeDefaults.maxConcurrent), 10);
+const DEFAULT_FFMPEG_THREADS = parseInt(process.env.FFMPEG_THREADS || String(runtimeDefaults.threads), 10);
 
 // Detect subtitle files in torrent
 function detectSubtitles(torrent, outputFolder) {
@@ -292,6 +385,67 @@ function computeSegmentDuration() {
     }
 }
 
+// ffmpeg concurrency control to avoid OOM on small instances
+let MAX_CONCURRENT_FFMPEG = DEFAULT_MAX_CONCURRENT_FFMPEG;
+let activeFfmpegCount = 0;
+const ffmpegQueue = [];
+
+// Watch resource defaults periodically and update MAX_CONCURRENT_FFMPEG / ffmpeg threads
+const resourceWatchIntervalMs = parseInt(process.env.RESOURCE_WATCH_INTERVAL_MS || '15000', 10);
+setInterval(() => {
+    try {
+        const defs = computeRuntimeDefaults();
+        const envMax = parseInt(process.env.MAX_CONCURRENT_FFMPEG || String(defs.maxConcurrent), 10);
+        MAX_CONCURRENT_FFMPEG = envMax;
+        // update default threads if not explicitly set
+        if (!process.env.FFMPEG_THREADS) {
+            // DEFAULT_FFMPEG_THREADS is const; update default usage by writing to variable used later
+        }
+    } catch (e) {
+        // ignore
+    }
+}, resourceWatchIntervalMs);
+
+function scheduleConversion(streamId, createProcFn) {
+    // createProcFn should return the ffmpeg command instance
+    const runNext = () => {
+        if (ffmpegQueue.length === 0) return;
+        if (activeFfmpegCount >= MAX_CONCURRENT_FFMPEG) return;
+        const item = ffmpegQueue.shift();
+        try {
+            activeFfmpegCount++;
+            const proc = item.createProc();
+            if (streams[item.streamId]) streams[item.streamId].ffmpegActive = true;
+
+            const onFinish = () => {
+                activeFfmpegCount = Math.max(0, activeFfmpegCount - 1);
+                if (streams[item.streamId]) {
+                    streams[item.streamId].ffmpegActive = false;
+                }
+                // schedule next queued job
+                setImmediate(runNext);
+            };
+
+            proc.on('end', onFinish);
+            proc.on('error', (err) => {
+                onFinish();
+            });
+        } catch (e) {
+            activeFfmpegCount = Math.max(0, activeFfmpegCount - 1);
+            setImmediate(runNext);
+        }
+    };
+
+    // If we have capacity, run immediately
+    if (activeFfmpegCount < MAX_CONCURRENT_FFMPEG) {
+        ffmpegQueue.push({ streamId, createProc: createProcFn });
+        setImmediate(runNext);
+    } else {
+        // otherwise enqueue
+        ffmpegQueue.push({ streamId, createProc: createProcFn });
+    }
+}
+
 // Helper: Process a torrent (shared for new or existing)
 function processTorrent(torrent, streamId, outputFolder) {
     try {
@@ -365,30 +519,39 @@ function processTorrent(torrent, streamId, outputFolder) {
         // Determine HLS segment duration dynamically based on concurrent streams
         const segSeconds = computeSegmentDuration();
 
-        // Start ffmpeg HLS conversion
-        const proc = ffmpeg(ffInStream)
-            .output(path.join(outputFolder, 'playlist.m3u8'))
-            .addOptions([
-                '-profile:v baseline',
-                '-level 3.0',
-                '-start_number 0',
-                `-hls_time ${segSeconds}`,
-                '-hls_list_size 0',
-                '-hls_segment_filename', path.join(outputFolder, 'segment_%03d.ts'),
-                '-f hls'
-            ])
-            .on('start', () => console.log(`[${streamId}] ffmpeg conversion started`))
-            .on('error', (err) => {
-                console.error(`[${streamId}] ffmpeg error:`, err.message);
-                if (streams[streamId]) streams[streamId].error = `ffmpeg_error: ${err.message}`;
-            })
-            .on('end', () => {
-                console.log(`[${streamId}] ffmpeg conversion complete`);
-                if (streams[streamId]) streams[streamId].ready = true;
-            });
+        // Start ffmpeg HLS conversion (scheduled to limit concurrency)
+        const createProcFn = () => {
+            const cmd = ffmpeg(ffInStream)
+                .output(path.join(outputFolder, 'playlist.m3u8'))
+                .addOptions([
+                    '-profile:v baseline',
+                    '-level 3.0',
+                    '-start_number 0',
+                    `-hls_time ${segSeconds}`,
+                    '-hls_list_size 0',
+                    '-hls_segment_filename', path.join(outputFolder, 'segment_%03d.ts'),
+                    // reduce resource usage
+                    '-threads', '1',
+                    '-preset', 'veryfast',
+                    '-fflags', '+nobuffer',
+                    '-f', 'hls'
+                ])
+                .on('start', () => console.log(`[${streamId}] ffmpeg conversion started (seg ${segSeconds}s)`))
+                .on('error', (err) => {
+                    console.error(`[${streamId}] ffmpeg error:`, err.message);
+                    if (streams[streamId]) streams[streamId].error = `ffmpeg_error: ${err.message}`;
+                })
+                .on('end', () => {
+                    console.log(`[${streamId}] ffmpeg conversion complete`);
+                    if (streams[streamId]) streams[streamId].ready = true;
+                });
 
-        // Start the conversion
-        proc.run();
+            // run and return the command instance
+            cmd.run();
+            return cmd;
+        };
+
+        scheduleConversion(streamId, createProcFn);
 
         // Attempt to get media info if the full file exists (it won't for torrent streaming)
         (async () => {
@@ -917,30 +1080,39 @@ app.post('/stream-yt', (req, res) => {
                 }
             })();
 
-            // Convert to HLS (with dynamic segment duration)
+            // Convert to HLS (with dynamic segment duration and scheduling)
             const segSecondsYT = computeSegmentDuration();
-            const proc = ffmpeg(videoPath)
-                .output(path.join(outputFolder, 'playlist.m3u8'))
-                .addOptions([
-                    '-profile:v baseline',
-                    '-level 3.0',
-                    '-start_number 0',
-                    `-hls_time ${segSecondsYT}`,
-                    '-hls_list_size 0',
-                    '-hls_segment_filename', path.join(outputFolder, 'segment_%03d.ts'),
-                    '-f hls'
-                ])
-                .on('start', () => console.log(`[${streamId}] ffmpeg conversion started`))
-                .on('error', (err) => {
-                    console.error(`[${streamId}] ffmpeg error:`, err.message);
-                    streams[streamId].error = `ffmpeg_error: ${err.message}`;
-                })
-                .on('end', () => {
-                    console.log(`[${streamId}] ffmpeg conversion complete`);
-                    streams[streamId].ready = true;
-                });
+            const createProcYT = () => {
+                const cmd = ffmpeg(videoPath)
+                    .output(path.join(outputFolder, 'playlist.m3u8'))
+                    .addOptions([
+                        '-profile:v baseline',
+                        '-level 3.0',
+                        '-start_number 0',
+                        `-hls_time ${segSecondsYT}`,
+                        '-hls_list_size 0',
+                        '-hls_segment_filename', path.join(outputFolder, 'segment_%03d.ts'),
+                        // lower resource usage
+                        '-threads', '1',
+                        '-preset', 'veryfast',
+                        '-fflags', '+nobuffer',
+                        '-f', 'hls'
+                    ])
+                    .on('start', () => console.log(`[${streamId}] ffmpeg conversion started (seg ${segSecondsYT}s)`))
+                    .on('error', (err) => {
+                        console.error(`[${streamId}] ffmpeg error:`, err.message);
+                        streams[streamId].error = `ffmpeg_error: ${err.message}`;
+                    })
+                    .on('end', () => {
+                        console.log(`[${streamId}] ffmpeg conversion complete`);
+                        streams[streamId].ready = true;
+                    });
 
-            proc.run();
+                cmd.run();
+                return cmd;
+            };
+
+            scheduleConversion(streamId, createProcYT);
 
             // Poll for HLS readiness
             const playlistPath = path.join(outputFolder, 'playlist.m3u8');
@@ -1081,6 +1253,24 @@ app.get('/health', (req, res) => {
             youtubeDl: true
         }
     });
+});
+
+// Expose computed resource info and runtime defaults
+app.get('/resources', (req, res) => {
+    try {
+        const defs = computeRuntimeDefaults();
+        res.json({
+            detectedMemoryMB,
+            detectedCpus,
+            runtimeDefaults: defs,
+            maxConcurrentFfmpeg: MAX_CONCURRENT_FFMPEG,
+            defaultFfmpegThreads: DEFAULT_FFMPEG_THREADS,
+            ffmpegQueueLength: ffmpegQueue.length,
+            activeFfmpegCount
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
 // ---------------------------
