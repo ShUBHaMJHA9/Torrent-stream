@@ -19,7 +19,8 @@ FROM node:22-alpine
 # FFmpeg for HLS conversion
 RUN apk add --no-cache \
     ffmpeg \
-    curl
+    curl \
+    dumb-init
 
 WORKDIR /app
 
@@ -30,8 +31,15 @@ COPY --from=builder /app/node_modules ./node_modules
 COPY package*.json ./
 COPY server.js .
 
-# Create temp directory for streams
-RUN mkdir -p /tmp/streams && chmod 777 /tmp/streams
+# Create temp directory for streams and ensure correct ownership
+RUN mkdir -p /tmp/streams /app/logs && \
+    chown -R node:node /tmp/streams /app /app/node_modules
+
+# Use non-root user for improved security
+USER node
+
+# Ensure working directory and permissions for node user
+WORKDIR /app
 
 # Set environment variables
 ENV NODE_ENV=production
@@ -44,5 +52,6 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:3000/health || exit 1
 
-# Run application
+# Use dumb-init as PID 1 to handle signals correctly on Koyeb
+ENTRYPOINT ["/sbin/dumb-init", "--"]
 CMD ["node", "server.js"]

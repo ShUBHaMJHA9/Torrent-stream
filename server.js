@@ -200,6 +200,98 @@ function formatDuration(seconds) {
     return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
+// Compute folder size (bytes) and return list of files sorted by mtime asc
+function getFolderFilesSorted(folder) {
+    try {
+        const files = fs.readdirSync(folder).map(name => {
+            const full = path.join(folder, name);
+            const stat = fs.statSync(full);
+            return { name, path: full, size: stat.size, mtime: stat.mtimeMs };
+        });
+        files.sort((a, b) => a.mtime - b.mtime);
+        return files;
+    } catch (e) {
+        return [];
+    }
+}
+
+function getFolderSize(folder) {
+    try {
+        const files = fs.readdirSync(folder);
+        let total = 0;
+        for (const f of files) {
+            try {
+                const stat = fs.statSync(path.join(folder, f));
+                if (stat.isFile()) total += stat.size;
+            } catch (e) {
+                // ignore
+            }
+        }
+        return total;
+    } catch (e) {
+        return 0;
+    }
+}
+
+// Enforce max storage bytes by deleting oldest segment files first
+function enforceStorageLimit(entry, maxBytes) {
+    try {
+        if (!entry || !entry.folder) return;
+        const folder = entry.folder;
+        let total = getFolderSize(folder);
+        if (total <= maxBytes) return;
+        const keepSegments = parseInt(process.env.KEEP_SEGMENTS || '5', 10); // keep newest N segments
+        const files = getFolderFilesSorted(folder);
+
+        // Identify segment files and non-segment files
+        const segmentFiles = files.filter(f => /segment_\d+\.ts$/.test(f.name));
+        const otherFiles = files.filter(f => !/segment_\d+\.ts$/.test(f.name));
+
+        // Determine segments to preserve (the newest `keepSegments`)
+        const segmentsToKeep = new Set(segmentFiles.slice(-keepSegments).map(f => f.name));
+
+        // Build deletion candidates: oldest segment files (excluding those kept), then other files (oldest first)
+        const deletableSegments = segmentFiles.filter(f => !segmentsToKeep.has(f.name));
+        const candidates = deletableSegments.concat(otherFiles);
+
+        for (const f of candidates) {
+            try {
+                // never delete playlist.m3u8 proactively
+                if (f.name === 'playlist.m3u8') continue;
+                // avoid deleting recently created segments we reserved
+                if (segmentsToKeep.has(f.name)) continue;
+                fs.unlinkSync(f.path);
+                total -= f.size;
+                if (total <= maxBytes) break;
+            } catch (e) {
+                // ignore deletion errors
+            }
+        }
+    } catch (e) {
+        // ignore
+    }
+}
+
+// Compute dynamic HLS segment duration based on current active streams.
+// Uses environment variables:
+//  MIN_SEGMENT_SECONDS (default 4)
+//  MAX_SEGMENT_SECONDS (default 10)
+//  TARGET_STREAMS_PER_SEGMENT (default 10) - how many streams per MIN_SEGMENT_SECONDS
+function computeSegmentDuration() {
+    try {
+        const active = Math.max(1, Object.keys(streams).length);
+        const MIN = parseInt(process.env.MIN_SEGMENT_SECONDS || '4', 10);
+        const MAX = parseInt(process.env.MAX_SEGMENT_SECONDS || '10', 10);
+        const TARGET = parseInt(process.env.TARGET_STREAMS_PER_SEGMENT || '10', 10);
+
+        const factor = Math.max(1, Math.ceil(active / TARGET));
+        const duration = factor * MIN;
+        return Math.min(MAX, Math.max(MIN, duration));
+    } catch (e) {
+        return parseInt(process.env.MIN_SEGMENT_SECONDS || '4', 10);
+    }
+}
+
 // Helper: Process a torrent (shared for new or existing)
 function processTorrent(torrent, streamId, outputFolder) {
     try {
@@ -245,21 +337,12 @@ function processTorrent(torrent, streamId, outputFolder) {
 
         console.log(`[${streamId}] using file: ${file.name} (${(file.length / (1024 * 1024)).toFixed(2)} MB)`);
 
+        // We deliberately DO NOT write the full video file to disk here.
+        // Instead, ffmpeg reads directly from the torrent file stream and
+        // HLS segments are produced on-the-fly. This keeps disk usage low
+        // (only segments + playlist are stored). For environments with
+        // limited storage (e.g. 2GB), we enforce a retention policy below.
         const filePath = path.join(outputFolder, file.name);
-
-        // Start file save stream (for later direct access via /stream/:id)
-        const saveStream = file.createReadStream();
-        const writeStream = fs.createWriteStream(filePath);
-        
-        saveStream.on('error', (err) => {
-            console.error(`[${streamId}] save stream error:`, err.message);
-        });
-        
-        writeStream.on('error', (err) => {
-            console.error(`[${streamId}] write stream error:`, err.message);
-        });
-        
-        saveStream.pipe(writeStream);
 
         // Extract subtitles in background if any
         if (detectedSubs.length > 0) {
@@ -279,6 +362,9 @@ function processTorrent(torrent, streamId, outputFolder) {
         // Create separate read stream for ffmpeg
         const ffInStream = file.createReadStream();
 
+        // Determine HLS segment duration dynamically based on concurrent streams
+        const segSeconds = computeSegmentDuration();
+
         // Start ffmpeg HLS conversion
         const proc = ffmpeg(ffInStream)
             .output(path.join(outputFolder, 'playlist.m3u8'))
@@ -286,7 +372,7 @@ function processTorrent(torrent, streamId, outputFolder) {
                 '-profile:v baseline',
                 '-level 3.0',
                 '-start_number 0',
-                '-hls_time 4',
+                `-hls_time ${segSeconds}`,
                 '-hls_list_size 0',
                 '-hls_segment_filename', path.join(outputFolder, 'segment_%03d.ts'),
                 '-f hls'
@@ -304,17 +390,17 @@ function processTorrent(torrent, streamId, outputFolder) {
         // Start the conversion
         proc.run();
 
-        // Get media info asynchronously
+        // Attempt to get media info if the full file exists (it won't for torrent streaming)
         (async () => {
             try {
-                // Wait for file to be written a bit
-                await new Promise(r => setTimeout(r, 2000));
-                
-                const mediaInfo = await getMediaInfo(filePath);
-                if (mediaInfo && streams[streamId]) {
-                    streams[streamId].mediaInfo = mediaInfo;
-                    streams[streamId].duration = mediaInfo.duration;
-                    console.log(`[${streamId}] media duration: ${mediaInfo.durationFormatted}`);
+                if (fs.existsSync(filePath)) {
+                    await new Promise(r => setTimeout(r, 2000));
+                    const mediaInfo = await getMediaInfo(filePath);
+                    if (mediaInfo && streams[streamId]) {
+                        streams[streamId].mediaInfo = mediaInfo;
+                        streams[streamId].duration = mediaInfo.duration;
+                        console.log(`[${streamId}] media duration: ${mediaInfo.durationFormatted}`);
+                    }
                 }
             } catch (e) {
                 console.error(`[${streamId}] media info error:`, e.message);
@@ -346,14 +432,19 @@ function processTorrent(torrent, streamId, outputFolder) {
             }
         }, 1000);
 
+        // Start storage enforcer for this stream to keep folder under limit
+        const maxBytes = parseInt(process.env.MAX_STREAM_STORAGE_BYTES || String(2 * 1024 * 1024 * 1024), 10); // default 2GB
+        const enforcer = setInterval(() => enforceStorageLimit(streams[streamId], maxBytes), 15 * 1000);
+
+        // Store enforcer to allow cleanup later
+        streams[streamId].storageEnforcer = enforcer;
+
         // Store stream metadata
         streams[streamId].torrent = torrent;
         streams[streamId].file = file;
         streams[streamId].filePath = filePath;
         streams[streamId].poll = poll;
-        streams[streamId].saveStream = saveStream;
-        streams[streamId].writeStream = writeStream;
-        streams[streamId].segmentDuration = 4; // seconds, matching HLS output
+        streams[streamId].segmentDuration = segSeconds; // seconds, matching HLS output (dynamic)
         streams[streamId].currentSegment = 0;
         streams[streamId].playbackPosition = 0; // seconds
 
@@ -826,14 +917,15 @@ app.post('/stream-yt', (req, res) => {
                 }
             })();
 
-            // Convert to HLS
+            // Convert to HLS (with dynamic segment duration)
+            const segSecondsYT = computeSegmentDuration();
             const proc = ffmpeg(videoPath)
                 .output(path.join(outputFolder, 'playlist.m3u8'))
                 .addOptions([
                     '-profile:v baseline',
                     '-level 3.0',
                     '-start_number 0',
-                    '-hls_time 4',
+                    `-hls_time ${segSecondsYT}`,
                     '-hls_list_size 0',
                     '-hls_segment_filename', path.join(outputFolder, 'segment_%03d.ts'),
                     '-f hls'
@@ -866,7 +958,7 @@ app.post('/stream-yt', (req, res) => {
                                 streams[streamId].ready = true;
                                 streams[streamId].playlistReady = Date.now();
                                 streams[streamId].totalSegments = segments.length;
-                                streams[streamId].segmentDuration = 4;
+                                streams[streamId].segmentDuration = segSecondsYT;
                                 streams[streamId].currentSegment = 0;
                                 streams[streamId].playbackPosition = 0;
                             }
@@ -878,7 +970,12 @@ app.post('/stream-yt', (req, res) => {
                 }
             }, 1000);
 
-            if (streams[streamId]) streams[streamId].poll = poll;
+                if (streams[streamId]) streams[streamId].poll = poll;
+
+                // Start storage enforcer for yt-dlp streams as well
+                const maxBytesYT = parseInt(process.env.MAX_STREAM_STORAGE_BYTES || String(2 * 1024 * 1024 * 1024), 10);
+                const enforcerYT = setInterval(() => enforceStorageLimit(streams[streamId], maxBytesYT), 15 * 1000);
+                streams[streamId].storageEnforcer = enforcerYT;
         });
 
         res.json({
@@ -1111,3 +1208,32 @@ process.on('SIGTERM', () => {
         process.exit(0);
     });
 });
+
+// Initialize dynamic segment duration monitor
+let currentSegmentDuration = computeSegmentDuration();
+console.log(`Initial HLS segment duration: ${currentSegmentDuration}s`);
+
+// Recompute every 5 seconds and update stream metadata (ffmpeg processes are not restarted automatically)
+const segmentMonitorInterval = parseInt(process.env.SEGMENT_MONITOR_INTERVAL_MS || '5000', 10);
+const segmentMonitor = setInterval(() => {
+    try {
+        const newDur = computeSegmentDuration();
+        if (newDur !== currentSegmentDuration) {
+            console.log(`HLS segment duration changed: ${currentSegmentDuration}s -> ${newDur}s (activeStreams=${Object.keys(streams).length})`);
+            currentSegmentDuration = newDur;
+            // Update metadata for all streams so status reflects the new duration
+            for (const id of Object.keys(streams)) {
+                try {
+                    streams[id].segmentDuration = currentSegmentDuration;
+                } catch (e) {
+                    // ignore
+                }
+            }
+        }
+    } catch (e) {
+        // ignore
+    }
+}, segmentMonitorInterval);
+
+// Clean up monitor on exit
+process.on('exit', () => clearInterval(segmentMonitor));
