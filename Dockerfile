@@ -49,10 +49,12 @@ ENV PORT=3000
 # Expose port
 EXPOSE 3000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+# Health check — give app more time to start on smaller instances
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:3000/health || exit 1
 
 # Use dumb-init as PID 1 to handle signals correctly on Koyeb
-ENTRYPOINT ["/sbin/dumb-init", "--"]
-CMD ["node", "server.js"]
+# apk's dumb-init installs to /usr/bin/dumb-init on Alpine
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+# Use npm start so Koyeb and standard workflows run the app via package.json
+CMD ["npm", "start"]
