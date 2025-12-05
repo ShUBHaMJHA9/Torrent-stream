@@ -1,16 +1,17 @@
 # Multi-stage build for optimized image size
 FROM node:22-alpine AS builder
 
-# Install build dependencies
-RUN apk add --no-cache python3 make g++
+# Install build dependencies required for npm native modules
+# `build-base` provides gcc, g++, make and libc-dev; `git` is useful for some packages
+RUN apk add --no-cache python3 build-base git
 
 WORKDIR /app
 
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies
-RUN npm ci --only=production
+# Install dependencies (use npm install so a missing package-lock won't fail builds on Koyeb)
+RUN npm install --production --no-audit --no-fund
 
 # Production stage
 FROM node:22-alpine
