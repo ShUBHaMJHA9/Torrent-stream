@@ -145,6 +145,8 @@ function computeRuntimeDefaults() {
 const runtimeDefaults = computeRuntimeDefaults();
 const DEFAULT_MAX_CONCURRENT_FFMPEG = parseInt(process.env.MAX_CONCURRENT_FFMPEG || String(runtimeDefaults.maxConcurrent), 10);
 const DEFAULT_FFMPEG_THREADS = parseInt(process.env.FFMPEG_THREADS || String(runtimeDefaults.threads), 10);
+// If the instance has very low memory, prefer serving MP4 directly instead of running ffmpeg
+const DEFAULT_DIRECT_FALLBACK_MB = parseInt(process.env.DIRECT_MP4_FALLBACK_MEMORY_MB || '1024', 10);
 
 // Detect subtitle files in torrent
 function detectSubtitles(torrent, outputFolder) {
@@ -519,72 +521,81 @@ function processTorrent(torrent, streamId, outputFolder) {
         // Determine HLS segment duration dynamically based on concurrent streams
         const segSeconds = computeSegmentDuration();
 
-        // Start ffmpeg HLS conversion (scheduled to limit concurrency)
-        const createProcFn = () => {
-            // Try to copy segments without re-encoding when possible (low memory).
-            const ext = path.extname(file.name || '').toLowerCase();
-            const preferCopy = ext === '.mp4';
-            const threads = parseInt(process.env.FFMPEG_THREADS || String(DEFAULT_FFMPEG_THREADS), 10) || 1;
+        // Decide whether to skip ffmpeg entirely on low-memory instances and serve MP4 directly
+        const ext = path.extname(file.name || '').toLowerCase();
+        const preferCopy = ext === '.mp4';
+        const directFallbackMb = parseInt(process.env.DIRECT_MP4_FALLBACK_MEMORY_MB || String(DEFAULT_DIRECT_FALLBACK_MB), 10);
 
-            if (preferCopy) {
+        if (preferCopy && detectedMemoryMB <= directFallbackMb) {
+            console.log(`[${streamId}] low-memory (${detectedMemoryMB}MB) — skipping ffmpeg, serving MP4 directly via range requests`);
+            streams[streamId].mode = 'direct_mp4';
+            // Mark ready so clients can request via /stream/:id (direct range streaming)
+            streams[streamId].ready = true;
+        } else {
+            // Start ffmpeg HLS conversion (scheduled to limit concurrency)
+            const createProcFn = () => {
+                const threads = parseInt(process.env.FFMPEG_THREADS || String(DEFAULT_FFMPEG_THREADS), 10) || 1;
+
+                if (preferCopy) {
+                    const cmd = ffmpeg(ffInStream)
+                        .output(path.join(outputFolder, 'playlist.m3u8'))
+                        .videoCodec('copy')
+                        .audioCodec('copy')
+                        .addOptions([
+                            '-start_number 0',
+                            `-hls_time ${segSeconds}`,
+                            '-hls_list_size 0',
+                            '-hls_segment_filename', path.join(outputFolder, 'segment_%03d.ts'),
+                            '-bsf:v', 'h264_mp4toannexb',
+                            '-fflags', '+nobuffer',
+                            '-threads', String(threads),
+                            '-f', 'hls'
+                        ])
+                        .on('start', () => console.log(`[${streamId}] ffmpeg copy-mode started (seg ${segSeconds}s)`))
+                        .on('error', (err) => {
+                            console.error(`[${streamId}] ffmpeg copy-mode error:`, err.message);
+                            if (streams[streamId]) streams[streamId].error = `ffmpeg_error: ${err.message}`;
+                        })
+                        .on('end', () => {
+                            console.log(`[${streamId}] ffmpeg copy-mode complete`);
+                            if (streams[streamId]) streams[streamId].ready = true;
+                        });
+
+                    cmd.run();
+                    return cmd;
+                }
+
                 const cmd = ffmpeg(ffInStream)
                     .output(path.join(outputFolder, 'playlist.m3u8'))
-                    .videoCodec('copy')
-                    .audioCodec('copy')
                     .addOptions([
+                        '-profile:v baseline',
+                        '-level 3.0',
                         '-start_number 0',
                         `-hls_time ${segSeconds}`,
                         '-hls_list_size 0',
                         '-hls_segment_filename', path.join(outputFolder, 'segment_%03d.ts'),
-                        '-bsf:v', 'h264_mp4toannexb',
-                        '-fflags', '+nobuffer',
+                        // reduce resource usage
                         '-threads', String(threads),
+                        '-preset', 'veryfast',
+                        '-fflags', '+nobuffer',
                         '-f', 'hls'
                     ])
-                    .on('start', () => console.log(`[${streamId}] ffmpeg copy-mode started (seg ${segSeconds}s)`))
+                    .on('start', () => console.log(`[${streamId}] ffmpeg conversion started (seg ${segSeconds}s)`))
                     .on('error', (err) => {
-                        console.error(`[${streamId}] ffmpeg copy-mode error:`, err.message);
+                        console.error(`[${streamId}] ffmpeg error:`, err.message);
                         if (streams[streamId]) streams[streamId].error = `ffmpeg_error: ${err.message}`;
                     })
                     .on('end', () => {
-                        console.log(`[${streamId}] ffmpeg copy-mode complete`);
+                        console.log(`[${streamId}] ffmpeg conversion complete`);
                         if (streams[streamId]) streams[streamId].ready = true;
                     });
 
                 cmd.run();
                 return cmd;
-            }
+            };
 
-            const cmd = ffmpeg(ffInStream)
-                .output(path.join(outputFolder, 'playlist.m3u8'))
-                .addOptions([
-                    '-profile:v baseline',
-                    '-level 3.0',
-                    '-start_number 0',
-                    `-hls_time ${segSeconds}`,
-                    '-hls_list_size 0',
-                    '-hls_segment_filename', path.join(outputFolder, 'segment_%03d.ts'),
-                    // reduce resource usage
-                    '-threads', String(threads),
-                    '-preset', 'veryfast',
-                    '-fflags', '+nobuffer',
-                    '-f', 'hls'
-                ])
-                .on('start', () => console.log(`[${streamId}] ffmpeg conversion started (seg ${segSeconds}s)`))
-                .on('error', (err) => {
-                    console.error(`[${streamId}] ffmpeg error:`, err.message);
-                    if (streams[streamId]) streams[streamId].error = `ffmpeg_error: ${err.message}`;
-                })
-                .on('end', () => {
-                    console.log(`[${streamId}] ffmpeg conversion complete`);
-                    if (streams[streamId]) streams[streamId].ready = true;
-                });
-
-            cmd.run();
-            return cmd;
-        };
-
-        scheduleConversion(streamId, createProcFn);
+            scheduleConversion(streamId, createProcFn);
+        }
 
         // Attempt to get media info if the full file exists (it won't for torrent streaming)
         (async () => {
@@ -952,62 +963,115 @@ app.get('/stream/:id', (req, res) => {
             return res.status(404).json({ error: 'stream not found' });
         }
 
-        const { file } = entry;
-        if (!file) {
+        const { file, filePath } = entry;
+        if (!file && !filePath) {
             return res.status(404).json({ error: 'file not ready' });
         }
 
         const range = req.headers.range;
-        const size = file.length;
 
-        // Set seek/resume headers
+        // Prepare headers common to both modes
         res.set({
             'Accept-Ranges': 'bytes',
-            'Content-Type': 'video/mp4',
             'X-Stream-Ready': entry.ready ? 'true' : 'false',
             'X-Subtitle-Count': (entry.extractedSubtitles?.length || 0).toString()
         });
 
-        if (!range) {
-            // Full file request
-            res.writeHead(200, {
-                'Content-Type': 'video/mp4',
-                'Content-Length': size,
-                'Accept-Ranges': 'bytes'
+        // Serve from WebTorrent File object when available
+        if (file) {
+            const size = file.length;
+            res.set('Content-Type', 'video/mp4');
+
+            if (!range) {
+                res.writeHead(200, {
+                    'Content-Type': 'video/mp4',
+                    'Content-Length': size,
+                    'Accept-Ranges': 'bytes'
+                });
+                const stream = file.createReadStream();
+                stream.on('error', (err) => {
+                    console.error(`Stream error for ${req.params.id}:`, err.message);
+                    res.destroy();
+                });
+                stream.pipe(res);
+                return;
+            }
+
+            // Range request for WebTorrent file
+            const parts = range.replace(/bytes=/, '').split('-');
+            const start = parseInt(parts[0], 10);
+            const end = parts[1] ? parseInt(parts[1], 10) : size - 1;
+
+            if (start >= size || end >= size || start > end) {
+                res.status(416).set('Content-Range', `bytes */${size}`).end();
+                return;
+            }
+
+            const chunkSize = end - start + 1;
+            res.writeHead(206, {
+                'Content-Range': `bytes ${start}-${end}/${size}`,
+                'Accept-Ranges': 'bytes',
+                'Content-Length': chunkSize,
+                'Content-Type': 'video/mp4'
             });
-            const stream = file.createReadStream();
+
+            const stream = file.createReadStream({ start, end });
             stream.on('error', (err) => {
-                console.error(`Stream error for ${req.params.id}:`, err.message);
+                console.error(`Range stream error for ${req.params.id}:`, err.message);
                 res.destroy();
             });
             stream.pipe(res);
             return;
         }
 
-        // Range request
-        const parts = range.replace(/bytes=/, '').split('-');
-        const start = parseInt(parts[0], 10);
-        const end = parts[1] ? parseInt(parts[1], 10) : size - 1;
+        // Serve from disk file path (e.g., yt-dlp output or fallback)
+        if (filePath && fs.existsSync(filePath)) {
+            const stat = fs.statSync(filePath);
+            const size = stat.size;
+            const ext = path.extname(filePath || '').toLowerCase();
+            const contentType = ext === '.mp4' ? 'video/mp4' : 'application/octet-stream';
+            res.set('Content-Type', contentType);
 
-        if (start >= size || end >= size || start > end) {
-            res.status(416).set('Content-Range', `bytes */${size}`).end();
+            if (!range) {
+                res.writeHead(200, {
+                    'Content-Type': contentType,
+                    'Content-Length': size,
+                    'Accept-Ranges': 'bytes'
+                });
+                const stream = fs.createReadStream(filePath);
+                stream.on('error', (err) => {
+                    console.error(`Disk stream error for ${req.params.id}:`, err.message);
+                    res.destroy();
+                });
+                stream.pipe(res);
+                return;
+            }
+
+            const parts = range.replace(/bytes=/, '').split('-');
+            const start = parseInt(parts[0], 10);
+            const end = parts[1] ? parseInt(parts[1], 10) : size - 1;
+
+            if (start >= size || end >= size || start > end) {
+                res.status(416).set('Content-Range', `bytes */${size}`).end();
+                return;
+            }
+
+            const chunkSize = end - start + 1;
+            res.writeHead(206, {
+                'Content-Range': `bytes ${start}-${end}/${size}`,
+                'Accept-Ranges': 'bytes',
+                'Content-Length': chunkSize,
+                'Content-Type': contentType
+            });
+
+            const stream = fs.createReadStream(filePath, { start, end });
+            stream.on('error', (err) => {
+                console.error(`Range disk stream error for ${req.params.id}:`, err.message);
+                res.destroy();
+            });
+            stream.pipe(res);
             return;
         }
-
-        const chunkSize = end - start + 1;
-        res.writeHead(206, {
-            'Content-Range': `bytes ${start}-${end}/${size}`,
-            'Accept-Ranges': 'bytes',
-            'Content-Length': chunkSize,
-            'Content-Type': 'video/mp4'
-        });
-
-        const stream = file.createReadStream({ start, end });
-        stream.on('error', (err) => {
-            console.error(`Range stream error for ${req.params.id}:`, err.message);
-            res.destroy();
-        });
-        stream.pipe(res);
 
     } catch (e) {
         console.error(`GET /stream/${req.params.id} error:`, e.message);
@@ -1093,6 +1157,22 @@ app.post('/stream-yt', (req, res) => {
 
             const videoPath = path.join(outputFolder, videoFile);
             console.log(`[${streamId}] found video: ${videoFile}`);
+
+                // Low-memory fallback: if MP4 and instance memory is low, skip ffmpeg and serve file directly
+                const ytdlpExt = path.extname(videoPath).toLowerCase();
+                const directFallbackMbYT = parseInt(process.env.DIRECT_MP4_FALLBACK_MEMORY_MB || String(DEFAULT_DIRECT_FALLBACK_MB), 10);
+                if (ytdlpExt === '.mp4' && detectedMemoryMB <= directFallbackMbYT) {
+                    console.log(`[${streamId}] low-memory (${detectedMemoryMB}MB) — yt-dlp produced MP4, skipping ffmpeg and serving file directly`);
+                    // Expose path for direct-range serving
+                    streams[streamId].filePath = videoPath;
+                    streams[streamId].ready = true;
+                    // Start storage enforcer for yt-dlp streams as well
+                    const maxBytesYT = parseInt(process.env.MAX_STREAM_STORAGE_BYTES || String(2 * 1024 * 1024 * 1024), 10);
+                    const enforcerYT = setInterval(() => enforceStorageLimit(streams[streamId], maxBytesYT), 15 * 1000);
+                    streams[streamId].storageEnforcer = enforcerYT;
+                    // return response flow continues (we still return same JSON below)
+                    return;
+                }
 
             if (!ffmpegAvailable) {
                 console.error(`[${streamId}] ffmpeg not available; cannot convert to HLS`);
