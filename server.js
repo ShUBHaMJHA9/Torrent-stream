@@ -717,6 +717,67 @@ app.post("/stream", (req, res) => {
     }
 });
 
+
+app.post("/subtitles", async (req, res) => {
+  const { magnet } = req.body;
+
+  if (!magnet || !magnet.startsWith("magnet:?")) {
+    return res.status(400).json({ error: "Invalid magnet link" });
+  }
+
+  const client = new WebTorrent();
+
+  try {
+    client.add(magnet, { destroyStoreOnDestroy: true }, (torrent) => {
+      // Extract subtitle files (.srt, .vtt)
+      const subtitles = torrent.files
+        .filter(f => f.name.endsWith(".srt") || f.name.endsWith(".vtt"))
+        .map(f => ({
+          name: f.name,
+          url: `/subtitle/${torrent.infoHash}/${encodeURIComponent(f.name)}`
+        }));
+
+      // Destroy client to free memory
+      client.destroy();
+
+      res.json({ subtitles });
+    });
+
+    // Timeout if metadata not fetched in 15s
+    setTimeout(() => {
+      client.destroy();
+      res.status(504).json({ error: "Timeout fetching metadata" });
+    }, 15000);
+
+  } catch (err) {
+    client.destroy();
+    res.status(500).json({ error: err.message || "Internal server error" });
+  }
+});
+
+// Optional endpoint to serve subtitle content if needed
+app.get("/subtitle/:infoHash/:fileName", async (req, res) => {
+  const { infoHash, fileName } = req.params;
+  const client = new WebTorrent();
+
+  client.add(`magnet:?xt=urn:btih:${infoHash}`, { destroyStoreOnDestroy: true }, (torrent) => {
+    const file = torrent.files.find(f => encodeURIComponent(f.name) === fileName);
+    if (!file) {
+      client.destroy();
+      return res.status(404).send("Subtitle not found");
+    }
+
+    // Stream subtitle
+    res.setHeader("Content-Type", "text/plain");
+    file.createReadStream().pipe(res);
+
+    file.getBuffer(() => {
+      client.destroy();
+    });
+  });
+});
+
+
 // ---------------------------
 // GET /status/:id - Stream status
 // ---------------------------
