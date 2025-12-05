@@ -777,132 +777,33 @@ app.get("/subtitle/:infoHash/:fileName", async (req, res) => {
   });
 });
 
-
 // ---------------------------
-// GET /status/:id - Stream status
+// GET /subtitles/:id - Return subtitle magnet links directly
 // ---------------------------
-app.get('/status/:id', (req, res) => {
+app.get('/subtitles/:id', (req, res) => {
     try {
         const entry = streams[req.params.id];
-        if (!entry) {
-            return res.status(404).json({ error: 'stream not found' });
+        if (!entry || !entry.torrent) {
+            return res.status(404).json({ error: 'stream not found or torrent missing' });
         }
 
-        const status = {
-            ready: !!entry.ready,
-            folder: entry.folder,
-            file: entry.file?.name || null,
-            error: entry.error || null,
-            createdAt: entry.createdAt,
-            elapsedSeconds: Math.floor((Date.now() - entry.createdAt) / 1000)
-        };
+        const torrent = entry.torrent;
 
-        // Add torrent info if available
-        if (entry.torrent) {
-            status.torrentName = entry.torrent.name;
-            status.torrentHash = entry.torrent.infoHash;
-            status.numPeers = entry.torrent.numPeers || 0;
-            status.progress = Math.round((entry.torrent.progress || 0) * 10000) / 100; // percent
-            status.downloadSpeed = entry.torrent.downloadSpeed || 0; // bytes/sec
-            status.ratio = Math.round((entry.torrent.ratio || 0) * 10000) / 10000;
+        // Filter subtitle files inside torrent
+        const subtitleFiles = torrent.files.filter(f => f.name.endsWith('.srt') || f.name.endsWith('.vtt'));
+
+        if (subtitleFiles.length === 0) {
+            return res.json({ subtitles: [] });
         }
 
-        if (entry.playlistReady) {
-            status.hlsReadyAt = entry.playlistReady;
-        }
+        // Generate magnet links for each subtitle
+        const subtitles = subtitleFiles.map(f => ({
+            name: f.name,
+            magnet: `magnet:?xt=urn:btih:${torrent.infoHash}&dn=${encodeURIComponent(f.path)}&tr=udp://tracker.openbittorrent.com:80/announce`
+        }));
 
-        // Add media information
-        if (entry.mediaInfo) {
-            status.mediaInfo = {
-                duration: entry.mediaInfo.duration,
-                durationFormatted: entry.mediaInfo.durationFormatted
-            };
-        }
+        res.json({ subtitles });
 
-        // Add subtitle information
-        if (entry.subtitles && entry.subtitles.length > 0) {
-            status.availableSubtitles = entry.subtitles.map(s => ({
-                name: s.name,
-                format: s.ext,
-                language: s.language,
-                size: s.size
-            }));
-        }
-
-        if (entry.extractedSubtitles && entry.extractedSubtitles.length > 0) {
-            status.extractedSubtitles = entry.extractedSubtitles.map(s => ({
-                name: s.name,
-                format: s.ext,
-                language: s.language,
-                path: `/subtitles/${req.params.id}/${s.name}`
-            }));
-        }
-
-        // Add seek control information
-        if (entry.ready) {
-            status.seekControl = {
-                currentPosition: entry.playbackPosition || 0,
-                currentSegment: entry.currentSegment || 0,
-                totalSegments: entry.totalSegments || 0,
-                segmentDuration: entry.segmentDuration || 4,
-                supportRangeRequests: true,
-                canSeek: entry.mediaInfo ? true : false
-            };
-        }
-
-        res.json(status);
-    } catch (e) {
-        console.error(`GET /status/${req.params.id} error:`, e.message);
-        res.status(500).json({ error: e.message });
-    }
-});
-
-// ---------------------------
-// GET /hls/:id/* - Serve HLS playlist and segments
-// ---------------------------
-app.use('/hls/:id', (req, res, next) => {
-    try {
-        const entry = streams[req.params.id];
-        if (!entry) {
-            return res.status(404).json({ error: 'stream not found' });
-        }
-
-        // Serve files from the output folder
-        express.static(entry.folder)(req, res, next);
-    } catch (e) {
-        console.error(`GET /hls/${req.params.id} error:`, e.message);
-        res.status(500).json({ error: e.message });
-    }
-});
-
-// ---------------------------
-// GET /subtitles/:id/:filename - Serve subtitle files
-// ---------------------------
-app.get('/subtitles/:id/:filename', (req, res) => {
-    try {
-        const entry = streams[req.params.id];
-        if (!entry) {
-            return res.status(404).json({ error: 'stream not found' });
-        }
-
-        const filename = req.params.filename;
-        const filepath = path.join(entry.folder, filename);
-
-        // Security: prevent directory traversal
-        if (!filepath.startsWith(entry.folder)) {
-            return res.status(403).json({ error: 'access denied' });
-        }
-
-        if (!fs.existsSync(filepath)) {
-            return res.status(404).json({ error: 'subtitle file not found' });
-        }
-
-        res.set({
-            'Content-Type': 'text/plain; charset=utf-8',
-            'Content-Disposition': `inline; filename="${filename}"`
-        });
-
-        fs.createReadStream(filepath).pipe(res);
     } catch (e) {
         console.error(`GET /subtitles/${req.params.id} error:`, e.message);
         res.status(500).json({ error: e.message });
