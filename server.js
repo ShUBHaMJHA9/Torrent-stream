@@ -717,7 +717,6 @@ app.post("/stream", (req, res) => {
     }
 });
 
-
 app.post("/subtitles", async (req, res) => {
   const { magnet } = req.body;
 
@@ -729,21 +728,25 @@ app.post("/subtitles", async (req, res) => {
 
   try {
     client.add(magnet, { destroyStoreOnDestroy: true }, (torrent) => {
-      // Extract subtitle files (.srt, .vtt)
+      
       const subtitles = torrent.files
         .filter(f => f.name.endsWith(".srt") || f.name.endsWith(".vtt"))
-        .map(f => ({
-          name: f.name,
-          url: `/subtitle/${torrent.infoHash}/${encodeURIComponent(f.name)}`
-        }));
+        .map(f => {
+          const fileMagnet =
+            `magnet:?xt=urn:btih:${torrent.infoHash}` +
+            `&dn=${encodeURIComponent(f.name)}` +
+            torrent.announce.map(tr => `&tr=${encodeURIComponent(tr)}`).join("");
 
-      // Destroy client to free memory
+          return {
+            name: f.name,
+            magnet: fileMagnet
+          };
+        });
+
       client.destroy();
-
       res.json({ subtitles });
     });
 
-    // Timeout if metadata not fetched in 15s
     setTimeout(() => {
       client.destroy();
       res.status(504).json({ error: "Timeout fetching metadata" });
