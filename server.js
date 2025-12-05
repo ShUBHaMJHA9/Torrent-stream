@@ -521,6 +521,40 @@ function processTorrent(torrent, streamId, outputFolder) {
 
         // Start ffmpeg HLS conversion (scheduled to limit concurrency)
         const createProcFn = () => {
+            // Try to copy segments without re-encoding when possible (low memory).
+            const ext = path.extname(file.name || '').toLowerCase();
+            const preferCopy = ext === '.mp4';
+            const threads = parseInt(process.env.FFMPEG_THREADS || String(DEFAULT_FFMPEG_THREADS), 10) || 1;
+
+            if (preferCopy) {
+                const cmd = ffmpeg(ffInStream)
+                    .output(path.join(outputFolder, 'playlist.m3u8'))
+                    .videoCodec('copy')
+                    .audioCodec('copy')
+                    .addOptions([
+                        '-start_number 0',
+                        `-hls_time ${segSeconds}`,
+                        '-hls_list_size 0',
+                        '-hls_segment_filename', path.join(outputFolder, 'segment_%03d.ts'),
+                        '-bsf:v', 'h264_mp4toannexb',
+                        '-fflags', '+nobuffer',
+                        '-threads', String(threads),
+                        '-f', 'hls'
+                    ])
+                    .on('start', () => console.log(`[${streamId}] ffmpeg copy-mode started (seg ${segSeconds}s)`))
+                    .on('error', (err) => {
+                        console.error(`[${streamId}] ffmpeg copy-mode error:`, err.message);
+                        if (streams[streamId]) streams[streamId].error = `ffmpeg_error: ${err.message}`;
+                    })
+                    .on('end', () => {
+                        console.log(`[${streamId}] ffmpeg copy-mode complete`);
+                        if (streams[streamId]) streams[streamId].ready = true;
+                    });
+
+                cmd.run();
+                return cmd;
+            }
+
             const cmd = ffmpeg(ffInStream)
                 .output(path.join(outputFolder, 'playlist.m3u8'))
                 .addOptions([
@@ -531,7 +565,7 @@ function processTorrent(torrent, streamId, outputFolder) {
                     '-hls_list_size 0',
                     '-hls_segment_filename', path.join(outputFolder, 'segment_%03d.ts'),
                     // reduce resource usage
-                    '-threads', '1',
+                    '-threads', String(threads),
                     '-preset', 'veryfast',
                     '-fflags', '+nobuffer',
                     '-f', 'hls'
@@ -546,7 +580,6 @@ function processTorrent(torrent, streamId, outputFolder) {
                     if (streams[streamId]) streams[streamId].ready = true;
                 });
 
-            // run and return the command instance
             cmd.run();
             return cmd;
         };
@@ -1082,37 +1115,81 @@ app.post('/stream-yt', (req, res) => {
 
             // Convert to HLS (with dynamic segment duration and scheduling)
             const segSecondsYT = computeSegmentDuration();
-            const createProcYT = () => {
-                const cmd = ffmpeg(videoPath)
-                    .output(path.join(outputFolder, 'playlist.m3u8'))
-                    .addOptions([
-                        '-profile:v baseline',
-                        '-level 3.0',
-                        '-start_number 0',
-                        `-hls_time ${segSecondsYT}`,
-                        '-hls_list_size 0',
-                        '-hls_segment_filename', path.join(outputFolder, 'segment_%03d.ts'),
-                        // lower resource usage
-                        '-threads', '1',
-                        '-preset', 'veryfast',
-                        '-fflags', '+nobuffer',
-                        '-f', 'hls'
-                    ])
-                    .on('start', () => console.log(`[${streamId}] ffmpeg conversion started (seg ${segSecondsYT}s)`))
-                    .on('error', (err) => {
-                        console.error(`[${streamId}] ffmpeg error:`, err.message);
-                        streams[streamId].error = `ffmpeg_error: ${err.message}`;
-                    })
-                    .on('end', () => {
-                        console.log(`[${streamId}] ffmpeg conversion complete`);
-                        streams[streamId].ready = true;
-                    });
 
-                cmd.run();
-                return cmd;
-            };
+            // Probe to decide whether we can copy without re-encoding
+            (async () => {
+                let useCopy = false;
+                try {
+                    const info = await getStreamInfo(videoPath);
+                    if (info && info.videoCodec && info.videoCodec.toLowerCase().includes('h264')) {
+                        useCopy = true;
+                    }
+                } catch (e) {
+                    // ignore probe errors
+                }
 
-            scheduleConversion(streamId, createProcYT);
+                const threads = parseInt(process.env.FFMPEG_THREADS || String(DEFAULT_FFMPEG_THREADS), 10) || 1;
+
+                const createProcYT = () => {
+                    if (useCopy) {
+                        const cmd = ffmpeg(videoPath)
+                            .output(path.join(outputFolder, 'playlist.m3u8'))
+                            .videoCodec('copy')
+                            .audioCodec('copy')
+                            .addOptions([
+                                '-start_number 0',
+                                `-hls_time ${segSecondsYT}`,
+                                '-hls_list_size 0',
+                                '-hls_segment_filename', path.join(outputFolder, 'segment_%03d.ts'),
+                                '-bsf:v', 'h264_mp4toannexb',
+                                '-fflags', '+nobuffer',
+                                '-threads', String(threads),
+                                '-f', 'hls'
+                            ])
+                            .on('start', () => console.log(`[${streamId}] ffmpeg copy-mode started (seg ${segSecondsYT}s)`))
+                            .on('error', (err) => {
+                                console.error(`[${streamId}] ffmpeg copy-mode error:`, err.message);
+                                streams[streamId].error = `ffmpeg_error: ${err.message}`;
+                            })
+                            .on('end', () => {
+                                console.log(`[${streamId}] ffmpeg copy-mode complete`);
+                                streams[streamId].ready = true;
+                            });
+
+                        cmd.run();
+                        return cmd;
+                    }
+
+                    const cmd = ffmpeg(videoPath)
+                        .output(path.join(outputFolder, 'playlist.m3u8'))
+                        .addOptions([
+                            '-profile:v baseline',
+                            '-level 3.0',
+                            '-start_number 0',
+                            `-hls_time ${segSecondsYT}`,
+                            '-hls_list_size 0',
+                            '-hls_segment_filename', path.join(outputFolder, 'segment_%03d.ts'),
+                            '-threads', String(threads),
+                            '-preset', 'veryfast',
+                            '-fflags', '+nobuffer',
+                            '-f', 'hls'
+                        ])
+                        .on('start', () => console.log(`[${streamId}] ffmpeg conversion started (seg ${segSecondsYT}s)`))
+                        .on('error', (err) => {
+                            console.error(`[${streamId}] ffmpeg error:`, err.message);
+                            streams[streamId].error = `ffmpeg_error: ${err.message}`;
+                        })
+                        .on('end', () => {
+                            console.log(`[${streamId}] ffmpeg conversion complete`);
+                            streams[streamId].ready = true;
+                        });
+
+                    cmd.run();
+                    return cmd;
+                };
+
+                scheduleConversion(streamId, createProcYT);
+            })();
 
             // Poll for HLS readiness
             const playlistPath = path.join(outputFolder, 'playlist.m3u8');
